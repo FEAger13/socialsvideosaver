@@ -23,8 +23,8 @@ if not TELEGRAM_BOT_TOKEN:
 # Создание Flask приложения
 app = Flask(__name__)
 
-# Создание Telegram Application
-telegram_app = Application.builder().token(TLEGRAM_BOT_TOKEN).build()
+# Создание Telegram Application (ИСПРАВЛЕНА ОПЕЧАТКА)
+telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
