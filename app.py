@@ -3,11 +3,10 @@ import logging
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.error import Conflict
 from dotenv import load_dotenv
 import yt_dlp
-import requests
-from flask import Flask
-from threading import Thread
+from flask import Flask, request
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -30,16 +29,20 @@ def home():
 def health():
     return "OK", 200
 
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=5000)
-
 class VideoDownloaderBot:
     def __init__(self):
         self.token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.webhook_url = os.getenv('RENDER_EXTERNAL_URL', '') + '/webhook'
+        
         if not self.token:
             raise ValueError("TELEGRAM_BOT_TOKEN не найден в .env файле")
         
-        self.application = Application.builder().token(self.token).build()
+        self.application = (
+            Application.builder()
+            .token(self.token)
+            .build()
+        )
+        
         self.setup_handlers()
         self.temp_dir = "temp"
         os.makedirs(self.temp_dir, exist_ok=True)
@@ -196,16 +199,10 @@ class VideoDownloaderBot:
         status_message = await update.message.reply_text("⏳ Анализирую ссылку...")
 
         try:
-            # Определяем платформу и скачиваем
-            video_info = await self.get_video_info(user_message)
-            if not video_info:
-                await status_message.edit_text("❌ Не удалось получить информацию о видео.")
-                return
-
             await status_message.edit_text("📥 Скачиваю видео в максимальном качестве...")
 
             # Скачиваем видео
-            file_path = await self.download_video(user_message, video_info)
+            file_path = await self.download_video(user_message)
             
             if file_path and os.path.exists(file_path):
                 # Отправляем видео
@@ -213,9 +210,8 @@ class VideoDownloaderBot:
                 
                 caption = f"""
 ✅ **Видео успешно скачано!**
-📊 Качество: {video_info.get('quality', 'Лучшее')}
 💾 Размер: {file_size:.1f}MB
-🎬 Платформа: {video_info['platform']}
+🎬 Платформа: {self.get_platform_name(user_message)}
                 """
                 
                 await update.message.reply_video(
@@ -235,21 +231,19 @@ class VideoDownloaderBot:
             logger.error(f"Ошибка: {str(e)}")
             await status_message.edit_text("❌ Произошла ошибка. Попробуйте другую ссылку.")
 
-    async def get_video_info(self, url: str) -> dict:
-        """Получает информацию о видео"""
-        platform = "Unknown"
+    def get_platform_name(self, url: str) -> str:
+        """Определяет название платформы по URL"""
         if 'youtube.com' in url or 'youtu.be' in url:
-            platform = "YouTube"
+            return "YouTube"
         elif 'tiktok.com' in url:
-            platform = "TikTok"
+            return "TikTok"
         elif 'instagram.com' in url:
-            platform = "Instagram"
+            return "Instagram"
         elif 'vk.com' in url:
-            platform = "VK"
-        
-        return {'platform': platform, 'quality': 'Max Quality'}
+            return "VK"
+        return "Unknown"
 
-    async def download_video(self, url: str, video_info: dict) -> str:
+    async def download_video(self, url: str) -> str:
         """Скачивает видео используя yt-dlp"""
         ydl_opts = {
             'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
@@ -257,8 +251,7 @@ class VideoDownloaderBot:
             'merge_output_format': 'mp4',
             'writesubtitles': False,
             'writeautomaticsub': False,
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,
         }
         
         try:
@@ -267,20 +260,47 @@ class VideoDownloaderBot:
                 filename = ydl.prepare_filename(info)
                 return filename
         except Exception as e:
-            raise Exception(f"Ошибка загрузки: {str(e)}")
+            logger.error(f"Ошибка скачивания: {str(e)}")
+            return None
 
-    def run(self):
-        """Запуск бота"""
-        logger.info("Бот запущен...")
+    async def setup_webhook(self):
+        """Настройка webhook"""
+        try:
+            await self.application.bot.set_webhook(
+                url=self.webhook_url,
+                allowed_updates=["message", "callback_query"]
+            )
+            logger.info(f"Webhook установлен: {self.webhook_url}")
+        except Exception as e:
+            logger.error(f"Ошибка установки webhook: {e}")
+
+    def run_webhook(self):
+        """Запуск бота с webhook"""
+        logger.info("Запуск бота с webhook...")
         
-        # Запускаем Flask в отдельном потоке
-        flask_thread = Thread(target=run_flask)
-        flask_thread.daemon = True
-        flask_thread.start()
+        # Настройка webhook при запуске
+        asyncio.run(self.setup_webhook())
         
-        # Запускаем бота
-        self.application.run_polling()
+        # Запуск Flask
+        port = int(os.environ.get('PORT', 5000))
+        flask_app.run(host='0.0.0.0', port=port)
+
+# Webhook endpoint для Flask
+@flask_app.route('/webhook', methods=['POST'])
+async def webhook():
+    """Endpoint для webhook"""
+    try:
+        data = await request.get_json()
+        update = Update.de_json(data, bot_instance.application.bot)
+        await bot_instance.application.process_update(update)
+        return 'ok', 200
+    except Exception as e:
+        logger.error(f"Ошибка в webhook: {e}")
+        return 'error', 500
+
+# Глобальный экземпляр бота
+bot_instance = None
 
 if __name__ == "__main__":
-    bot = VideoDownloaderBot()
-    bot.run()
+    bot_instance = VideoDownloaderBot()
+    bot_instance.run_webhook()
