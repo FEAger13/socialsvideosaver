@@ -37,6 +37,9 @@ def create_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_handler))
     
+    # ИНИЦИАЛИЗИРУЕМ приложение
+    app.initialize()
+    
     return app
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,11 +187,15 @@ def webhook():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
+                # Теперь application инициализирован и должен работать
                 loop.run_until_complete(application.process_update(update))
+            except Exception as e:
+                logger.error(f"Error processing update: {e}")
             finally:
                 loop.close()
         
         thread = threading.Thread(target=process_update)
+        thread.daemon = True
         thread.start()
         
         return "ok", 200
@@ -234,7 +241,7 @@ def initialize_bot():
     
     logger.info("Инициализация бота...")
     
-    # Создаем приложение
+    # Создаем и инициализируем приложение
     application = create_application()
     if application is None:
         logger.error("Не удалось создать приложение бота")
@@ -248,7 +255,7 @@ def initialize_bot():
         loop.close()
         
         if success:
-            logger.info("Бот успешно инициализирован")
+            logger.info("Бот успешно инициализирован и webhook настроен")
         else:
             logger.error("Не удалось настроить webhook")
             
