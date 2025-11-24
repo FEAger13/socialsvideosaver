@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import yt_dlp
@@ -149,6 +150,10 @@ def run_bot():
         return
     
     try:
+        # Создаем новое event loop для этого потока
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         # Создаем приложение
         application = Application.builder().token(BOT_TOKEN).build()
         
@@ -159,6 +164,8 @@ def run_bot():
         application.add_handler(CallbackQueryHandler(button_handler))
         
         logger.info("Запускаем бота...")
+        
+        # Запускаем бота с polling
         application.run_polling()
         
     except Exception as e:
