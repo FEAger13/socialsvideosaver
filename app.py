@@ -6,6 +6,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from dotenv import load_dotenv
 import yt_dlp
 from flask import Flask, request
+import threading
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -143,14 +144,18 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """Endpoint для webhook"""
     global bot_app
     try:
         if bot_app:
+            # Создаем новый event loop для обработки update
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
             update = Update.de_json(request.get_json(), bot_app.bot)
-            asyncio.run_coroutine_threadsafe(
-                bot_app.process_update(update),
-                bot_app._get_running_loop()
-            )
+            loop.run_until_complete(bot_app.process_update(update))
+            loop.close()
+            
         return 'ok', 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -166,12 +171,12 @@ async def setup_webhook():
             await bot_app.bot.set_webhook(webhook_url)
             logger.info(f"Webhook установлен: {webhook_url}")
         else:
-            logger.warning("RENDER_EXTERNAL_URL не найден, используем polling")
+            logger.warning("RENDER_EXTERNAL_URL не найден")
     except Exception as e:
         logger.error(f"Ошибка webhook: {e}")
 
-def run():
-    """Запуск приложения"""
+def run_bot():
+    """Запуск бота в отдельном потоке"""
     global bot_app
     
     # Инициализируем бота
@@ -179,16 +184,17 @@ def run():
     
     if bot_app:
         # Настраиваем webhook
-        asyncio.run(setup_webhook())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_webhook())
+        loop.close()
         
-        # Запускаем бота в фоне
-        bot_app._get_running_loop()
-        logger.info("Бот запущен")
+        logger.info("Бот инициализирован и webhook настроен")
     else:
         logger.error("Не удалось инициализировать бота")
 
-# Запускаем при старте
-run()
+# Запускаем бота при старте приложения
+run_bot()
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
