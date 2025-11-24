@@ -1,12 +1,14 @@
 import os
 import logging
-import tempfile
-from flask import Flask, request
+import json
+from flask import Flask, request, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
 import asyncio
 from threading import Thread
+import tempfile
+import shutil
 
 # Настройка логирования
 logging.basicConfig(
@@ -23,8 +25,21 @@ if not TELEGRAM_BOT_TOKEN:
 # Создание Flask приложения
 app = Flask(__name__)
 
-# Создание Telegram Application (ИСПРАВЛЕНА ОПЕЧАТКА)
+# Инициализация Telegram бота
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+# Создаем временную директорию
+TEMP_DIR = "temp_videos"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def cleanup_temp_files():
+    """Очистка временных файлов"""
+    try:
+        if os.path.exists(TEMP_DIR):
+            shutil.rmtree(TEMP_DIR)
+            os.makedirs(TEMP_DIR, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Error cleaning temp files: {e}")
 
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -33,27 +48,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Отправьте мне ссылку на YouTube видео, и я скачаю его в максимальном качестве!
 
-📹 Поддерживаемые форматы:
-• MP4 (видео)
-• MP3 (аудио)
-
-⚡ Просто отправьте ссылку и выберите формат!
+⚡ Просто отправьте ссылку на YouTube!
     """
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
 # Функция для скачивания видео
-def download_video(url, quality='best'):
-    ydl_opts = {
-        'outtmpl': 'temp/%(title)s.%(ext)s',
-        'format': 'best' if quality == 'best' else 'worst',
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        return filename, info
+def download_video(url):
+    try:
+        # Очищаем временные файлы перед загрузкой
+        cleanup_temp_files()
+        
+        ydl_opts = {
+            'outtmpl': os.path.join(TEMP_DIR, '%(title).100s.%(ext)s'),
+            'format': 'best[height<=1080]',  # Максимальное качество до 1080p
+            'quiet': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename, info
+            
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        raise
 
-# Обработчик текстовых сообщений (ссылок)
+# Обработчик текстовых сообщений
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     
@@ -66,68 +86,124 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Отправляем сообщение о начале загрузки
         status_msg = await update.message.reply_text("⏬ Начинаю загрузку видео...")
         
-        # Скачиваем видео в максимальном качестве
-        filename, video_info = await asyncio.to_thread(download_video, url, 'best')
+        # Скачиваем видео
+        filename, video_info = await asyncio.to_thread(download_video, url)
+        
+        # Проверяем размер файла (Telegram ограничение 50MB)
+        file_size = os.path.getsize(filename) / (1024 * 1024)  # в MB
+        if file_size > 50:
+            await update.message.reply_text(f"❌ Файл слишком большой ({file_size:.1f}MB). Максимальный размер 50MB.")
+            os.remove(filename)
+            return
         
         # Отправляем видео
-        await update.message.reply_video(
-            video=open(filename, 'rb'),
-            caption=f"🎬 **{video_info.get('title', 'Video')}**\n"
-                   f"⏱ Длительность: {video_info.get('duration', 0)} сек.\n"
-                   f"📊 Качество: максимальное",
-            parse_mode='Markdown'
-        )
+        with open(filename, 'rb') as video_file:
+            await update.message.reply_video(
+                video=video_file,
+                caption=f"🎬 **{video_info.get('title', 'Video')}**\n"
+                       f"⏱ Длительность: {video_info.get('duration', 0)} сек.\n"
+                       f"📊 Качество: {video_info.get('resolution', 'max')}",
+                parse_mode='Markdown'
+            )
         
         # Удаляем временный файл
         os.remove(filename)
         await status_msg.delete()
         
     except Exception as e:
-        logger.error(f"Error downloading video: {e}")
-        await update.message.reply_text("❌ Произошла ошибка при загрузке видео. Попробуйте еще раз.")
+        logger.error(f"Error processing video: {e}")
+        await update.message.reply_text("❌ Произошла ошибка при загрузке видео. Попробуйте другую ссылку.")
 
 # Настройка хендлеров
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# Webhook маршруты для Render
+# Webhook маршруты
 @app.route('/')
 def home():
-    return "YouTube Downloader Bot is running!"
+    return "🤖 YouTube Downloader Bot is running! Use /start in Telegram."
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Endpoint для вебхука Telegram"""
+    """Правильная обработка вебхука"""
     try:
-        json_str = request.get_data().decode('UTF-8')
-        update = Update.de_json(json_str, telegram_app.bot)
+        # Получаем JSON данные
+        json_data = request.get_json()
+        logger.info(f"Received webhook: {json_data}")
         
-        # Запускаем обработку обновления в отдельном потоке
-        thread = Thread(target=asyncio.run, args=(telegram_app.process_update(update),))
-        thread.start()
-        
-        return 'OK'
+        if json_data:
+            # Создаем Update объект
+            update = Update.de_json(json_data, telegram_app.bot)
+            
+            # Обрабатываем обновление в отдельном потоке
+            def process_update():
+                try:
+                    asyncio.run(telegram_app.process_update(update))
+                except Exception as e:
+                    logger.error(f"Error processing update: {e}")
+            
+            thread = Thread(target=process_update)
+            thread.start()
+            
+            return 'OK'
+        else:
+            logger.error("Empty webhook data")
+            return 'ERROR: Empty data'
+            
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return 'ERROR'
 
 @app.route('/set_webhook', methods=['GET'])
 def set_webhook():
-    """Установка вебхука (вызывается один раз после деплоя)"""
-    webhook_url = f"https://{request.host}/webhook"
-    result = telegram_app.bot.set_webhook(webhook_url)
-    return f"Webhook set to {webhook_url}: {result}"
+    """Установка вебхука"""
+    try:
+        webhook_url = f"https://{request.host}/webhook"
+        result = telegram_app.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to {webhook_url}: {result}")
+        return jsonify({
+            "status": "success",
+            "webhook_url": webhook_url,
+            "result": result
+        })
+    except Exception as e:
+        logger.error(f"Set webhook error: {e}")
+        return jsonify({"status": "error", "error": str(e)})
+
+@app.route('/delete_webhook', methods=['GET'])
+def delete_webhook():
+    """Удаление вебхука"""
+    try:
+        result = telegram_app.bot.delete_webhook()
+        return jsonify({"status": "success", "result": result})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)})
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Endpoint для проверки работоспособности (для cron-job.org)"""
-    return {'status': 'healthy', 'bot': 'running'}
+    """Проверка здоровья"""
+    return jsonify({
+        "status": "healthy", 
+        "service": "YouTube Downloader Bot",
+        "bot_initialized": True
+    })
 
-# Запуск приложения
+# Инициализация при запуске
+def initialize_bot():
+    """Инициализация бота при запуске"""
+    try:
+        # Устанавливаем вебхук автоматически
+        with app.app_context():
+            webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME', '')}/webhook"
+            if webhook_url.startswith("https://"):
+                telegram_app.bot.set_webhook(webhook_url)
+                logger.info(f"Auto-set webhook to: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Auto-webhook setup failed: {e}")
+
+# Запуск инициализации
+initialize_bot()
+
 if __name__ == '__main__':
-    # Создаем временную директорию
-    os.makedirs('temp', exist_ok=True)
-    
-    # Устанавливаем вебхук при запуске
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
