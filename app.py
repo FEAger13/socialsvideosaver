@@ -6,7 +6,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from dotenv import load_dotenv
 import yt_dlp
 from flask import Flask, request
-import threading
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -34,6 +33,7 @@ def init_bot():
         logger.error("TELEGRAM_BOT_TOKEN не найден")
         return None
     
+    # Создаем и инициализируем приложение
     bot_app = Application.builder().token(token).build()
     
     # Регистрируем обработчики
@@ -41,6 +41,9 @@ def init_bot():
     bot_app.add_handler(CommandHandler("help", help_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Инициализируем приложение
+    bot_app.initialize()
     
     return bot_app
 
@@ -148,15 +151,29 @@ def webhook():
     global bot_app
     try:
         if bot_app:
-            # Создаем новый event loop для обработки update
+            # Получаем данные запроса
+            json_data = request.get_json()
+            if not json_data:
+                return 'no data', 400
+                
+            # Создаем объект Update
+            update = Update.de_json(json_data, bot_app.bot)
+            
+            # Обрабатываем update
+            async def process_update():
+                await bot_app.process_update(update)
+            
+            # Запускаем в event loop
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            
-            update = Update.de_json(request.get_json(), bot_app.bot)
-            loop.run_until_complete(bot_app.process_update(update))
+            loop.run_until_complete(process_update())
             loop.close()
             
-        return 'ok', 200
+            return 'ok', 200
+        else:
+            logger.error("Bot app not initialized")
+            return 'bot not ready', 503
+            
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return 'error', 500
@@ -170,13 +187,16 @@ async def setup_webhook():
             webhook_url = f"{render_url}/webhook"
             await bot_app.bot.set_webhook(webhook_url)
             logger.info(f"Webhook установлен: {webhook_url}")
+            return True
         else:
             logger.warning("RENDER_EXTERNAL_URL не найден")
+            return False
     except Exception as e:
         logger.error(f"Ошибка webhook: {e}")
+        return False
 
 def run_bot():
-    """Запуск бота в отдельном потоке"""
+    """Запуск бота"""
     global bot_app
     
     # Инициализируем бота
@@ -186,10 +206,13 @@ def run_bot():
         # Настраиваем webhook
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(setup_webhook())
+        success = loop.run_until_complete(setup_webhook())
         loop.close()
         
-        logger.info("Бот инициализирован и webhook настроен")
+        if success:
+            logger.info("Бот инициализирован и webhook настроен")
+        else:
+            logger.error("Не удалось настроить webhook")
     else:
         logger.error("Не удалось инициализировать бота")
 
