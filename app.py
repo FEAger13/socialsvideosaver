@@ -1,11 +1,12 @@
 import os
 import logging
-import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import tempfile
+from flask import Flask, request
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
-from flask import Flask
-import threading
+import asyncio
+from threading import Thread
 
 # Настройка логирования
 logging.basicConfig(
@@ -14,172 +15,119 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Создаем Flask app для мониторинга
+# Получение токена из переменных окружения Render
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+
+# Создание Flask приложения
 app = Flask(__name__)
 
-# Глобальные переменные
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-temp_dir = "temp"
+# Создание Telegram Application
+telegram_app = Application.builder().token(TLEGRAM_BOT_TOKEN).build()
 
-@app.route('/')
-def home():
-    return "🤖 Bot is running!", 200
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
+# Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    keyboard = [
-        [InlineKeyboardButton("📥 Скачать видео", callback_data="download_info")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    text = (
-        "🤖 **Video Downloader Bot**\n\n"
-        "Я могу скачать видео с:\n"
-        "• YouTube\n• TikTok\n• Instagram\n• VK\n\n"
-        "Просто отправьте мне ссылку на видео!"
-    )
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+    welcome_text = """
+🤖 **YouTube Video Downloader Bot**
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
-    text = (
-        "📖 **Как использовать:**\n"
-        "1. Отправьте ссылку на видео\n"
-        "2. Я скачаю его в максимальном качестве\n\n"
-        "🔗 **Поддерживаемые платформы:**\n"
-        "• YouTube\n• TikTok\n• Instagram\n• VK"
-    )
-    await update.message.reply_text(text, parse_mode='Markdown')
+Отправьте мне ссылку на YouTube видео, и я скачаю его в максимальном качестве!
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик инлайн кнопок"""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "download_info":
-        await query.message.reply_text("📥 Отправьте ссылку на видео")
-    elif query.data == "help":
-        await help_command(update, context)
+📹 Поддерживаемые форматы:
+• MP4 (видео)
+• MP3 (аудио)
 
-def is_supported_url(url: str) -> bool:
-    """Проверяет поддержку URL"""
-    supported_domains = [
-        'youtube.com', 'youtu.be', 
-        'tiktok.com', 'vm.tiktok.com',
-        'instagram.com', 
-        'vk.com'
-    ]
-    url_lower = url.lower()
-    return any(domain in url_lower for domain in supported_domains)
+⚡ Просто отправьте ссылку и выберите формат!
+    """
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
-    user_message = update.message.text.strip()
-    
-    if not user_message.startswith(('http://', 'https://')):
-        await update.message.reply_text("❌ Пожалуйста, отправьте валидную ссылку на видео")
-        return
-
-    if not is_supported_url(user_message):
-        await update.message.reply_text("❌ Этот тип ссылки не поддерживается")
-        return
-
-    # Отправляем сообщение о начале загрузки
-    status_message = await update.message.reply_text("⏳ Скачиваю видео...")
-
-    try:
-        # Скачиваем видео
-        file_path = await download_video(user_message)
-        
-        if file_path and os.path.exists(file_path):
-            # Получаем размер файла
-            file_size = os.path.getsize(file_path) / (1024 * 1024)  # в MB
-            
-            caption = f"✅ **Видео скачано!**\n💾 Размер: {file_size:.1f}MB"
-            
-            # Отправляем видео
-            await update.message.reply_video(
-                video=open(file_path, 'rb'),
-                caption=caption,
-                supports_streaming=True,
-                parse_mode='Markdown'
-            )
-            
-            # Удаляем статус сообщение и временный файл
-            await status_message.delete()
-            os.remove(file_path)
-            
-        else:
-            await status_message.edit_text("❌ Не удалось скачать видео. Попробуйте другую ссылку.")
-            
-    except Exception as e:
-        logger.error(f"Ошибка при обработке видео: {str(e)}")
-        await status_message.edit_text("❌ Произошла ошибка. Попробуйте другую ссылку.")
-
-async def download_video(url: str) -> str:
-    """Скачивает видео с использованием yt-dlp"""
-    # Создаем временную директорию
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Настройки для yt-dlp
+# Функция для скачивания видео
+def download_video(url, quality='best'):
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'outtmpl': os.path.join(temp_dir, '%(title).100s.%(ext)s'),
-        'quiet': True,
+        'outtmpl': 'temp/%(title)s.%(ext)s',
+        'format': 'best' if quality == 'best' else 'worst',
     }
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            logger.info(f"Видео скачано: {filename}")
-            return filename
-    except Exception as e:
-        logger.error(f"Ошибка скачивания: {str(e)}")
-        return None
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        return filename, info
 
-def run_bot():
-    """Запускает бота в отдельном потоке"""
-    if not BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN не найден")
+# Обработчик текстовых сообщений (ссылок)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    
+    # Проверка на YouTube ссылку
+    if 'youtube.com' not in url and 'youtu.be' not in url:
+        await update.message.reply_text("❌ Пожалуйста, отправьте действительную ссылку на YouTube видео.")
         return
     
     try:
-        # Создаем новое event loop для этого потока
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Отправляем сообщение о начале загрузки
+        status_msg = await update.message.reply_text("⏬ Начинаю загрузку видео...")
         
-        # Создаем приложение
-        application = Application.builder().token(BOT_TOKEN).build()
+        # Скачиваем видео в максимальном качестве
+        filename, video_info = await asyncio.to_thread(download_video, url, 'best')
         
-        # Добавляем обработчики
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("help", help_command))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        application.add_handler(CallbackQueryHandler(button_handler))
+        # Отправляем видео
+        await update.message.reply_video(
+            video=open(filename, 'rb'),
+            caption=f"🎬 **{video_info.get('title', 'Video')}**\n"
+                   f"⏱ Длительность: {video_info.get('duration', 0)} сек.\n"
+                   f"📊 Качество: максимальное",
+            parse_mode='Markdown'
+        )
         
-        logger.info("Запускаем бота...")
-        
-        # Запускаем бота с polling
-        application.run_polling()
+        # Удаляем временный файл
+        os.remove(filename)
+        await status_msg.delete()
         
     except Exception as e:
-        logger.error(f"Ошибка запуска бота: {e}")
+        logger.error(f"Error downloading video: {e}")
+        await update.message.reply_text("❌ Произошла ошибка при загрузке видео. Попробуйте еще раз.")
 
-def run_flask():
-    """Запускает Flask app"""
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+# Настройка хендлеров
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-if __name__ == "__main__":
-    # Запускаем бота в отдельном потоке
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+# Webhook маршруты для Render
+@app.route('/')
+def home():
+    return "YouTube Downloader Bot is running!"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Endpoint для вебхука Telegram"""
+    try:
+        json_str = request.get_data().decode('UTF-8')
+        update = Update.de_json(json_str, telegram_app.bot)
+        
+        # Запускаем обработку обновления в отдельном потоке
+        thread = Thread(target=asyncio.run, args=(telegram_app.process_update(update),))
+        thread.start()
+        
+        return 'OK'
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return 'ERROR'
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Установка вебхука (вызывается один раз после деплоя)"""
+    webhook_url = f"https://{request.host}/webhook"
+    result = telegram_app.bot.set_webhook(webhook_url)
+    return f"Webhook set to {webhook_url}: {result}"
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint для проверки работоспособности (для cron-job.org)"""
+    return {'status': 'healthy', 'bot': 'running'}
+
+# Запуск приложения
+if __name__ == '__main__':
+    # Создаем временную директорию
+    os.makedirs('temp', exist_ok=True)
     
-    # Запускаем Flask в основном потоке
-    run_flask()
+    # Устанавливаем вебхук при запуске
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
