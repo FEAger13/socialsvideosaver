@@ -3,12 +3,9 @@ import logging
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from dotenv import load_dotenv
 import yt_dlp
 from flask import Flask, request
-
-# Загрузка переменных окружения
-load_dotenv()
+import threading
 
 # Настройка логирования
 logging.basicConfig(
@@ -21,125 +18,144 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Глобальные переменные
-bot_app = None
+application = None
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 temp_dir = "temp"
 
-def init_bot():
-    """Инициализация бота"""
-    global bot_app
-    
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    if not token:
+def create_application():
+    """Создает и настраивает приложение бота"""
+    if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN не найден")
         return None
     
-    # Создаем и инициализируем приложение
-    bot_app = Application.builder().token(token).build()
+    # Создаем приложение
+    app = Application.builder().token(BOT_TOKEN).build()
     
-    # Регистрируем обработчики
-    bot_app.add_handler(CommandHandler("start", start_command))
-    bot_app.add_handler(CommandHandler("help", help_command))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    bot_app.add_handler(CallbackQueryHandler(button_handler))
+    # Добавляем обработчики
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_handler))
     
-    # Инициализируем приложение
-    bot_app.initialize()
-    
-    return bot_app
+    return app
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     keyboard = [
         [InlineKeyboardButton("📥 Скачать видео", callback_data="download_info")],
         [InlineKeyboardButton("❓ Помощь", callback_data="help")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    text = "🤖 **Video Downloader Bot**\n\nОтправьте ссылку на видео с YouTube, TikTok, Instagram или VK"
+    text = (
+        "🤖 **Video Downloader Bot**\n\n"
+        "Я могу скачать видео с:\n"
+        "• YouTube\n• TikTok\n• Instagram\n• VK\n\n"
+        "Просто отправьте мне ссылку на видео!"
+    )
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = """
-📖 **Как использовать:**
-1. Отправьте ссылку на видео
-2. Я скачаю его в максимальном качестве
-
-🔗 **Поддерживаемые платформы:**
-• YouTube
-• TikTok  
-• Instagram
-• VK
-    """
+    """Обработчик команды /help"""
+    text = (
+        "📖 **Как использовать:**\n"
+        "1. Отправьте ссылку на видео\n"
+        "2. Я скачаю его в максимальном качестве\n\n"
+        "🔗 **Поддерживаемые платформы:**\n"
+        "• YouTube\n• TikTok\n• Instagram\n• VK"
+    )
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик инлайн кнопок"""
     query = update.callback_query
     await query.answer()
     
     if query.data == "download_info":
-        text = "📥 Отправьте ссылку на видео"
-        await query.message.reply_text(text)
+        await query.message.reply_text("📥 Отправьте ссылку на видео")
     elif query.data == "help":
         await help_command(update, context)
 
 def is_supported_url(url: str) -> bool:
-    supported_domains = ['youtube.com', 'youtu.be', 'tiktok.com', 'vm.tiktok.com', 'instagram.com', 'vk.com']
-    return any(domain in url.lower() for domain in supported_domains)
+    """Проверяет поддержку URL"""
+    supported_domains = [
+        'youtube.com', 'youtu.be', 
+        'tiktok.com', 'vm.tiktok.com',
+        'instagram.com', 
+        'vk.com'
+    ]
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in supported_domains)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик текстовых сообщений"""
     user_message = update.message.text.strip()
     
     if not user_message.startswith(('http://', 'https://')):
-        await update.message.reply_text("❌ Отправьте валидную ссылку на видео")
+        await update.message.reply_text("❌ Пожалуйста, отправьте валидную ссылку на видео")
         return
 
     if not is_supported_url(user_message):
-        await update.message.reply_text("❌ Ссылка не поддерживается")
+        await update.message.reply_text("❌ Этот тип ссылки не поддерживается")
         return
 
-    status_msg = await update.message.reply_text("⏳ Скачиваю видео...")
+    # Отправляем сообщение о начале загрузки
+    status_message = await update.message.reply_text("⏳ Скачиваю видео...")
 
     try:
+        # Скачиваем видео
         file_path = await download_video(user_message)
         
         if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path) / (1024 * 1024)
-            caption = f"✅ **Готово!**\n💾 Размер: {file_size:.1f}MB"
+            # Получаем размер файла
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # в MB
             
+            caption = f"✅ **Видео скачано!**\n💾 Размер: {file_size:.1f}MB"
+            
+            # Отправляем видео
             await update.message.reply_video(
                 video=open(file_path, 'rb'),
                 caption=caption,
                 supports_streaming=True,
                 parse_mode='Markdown'
             )
-            await status_msg.delete()
+            
+            # Удаляем статус сообщение и временный файл
+            await status_message.delete()
             os.remove(file_path)
+            
         else:
-            await status_msg.edit_text("❌ Ошибка скачивания")
+            await status_message.edit_text("❌ Не удалось скачать видео. Попробуйте другую ссылку.")
             
     except Exception as e:
-        logger.error(f"Ошибка: {str(e)}")
-        await status_msg.edit_text("❌ Ошибка. Попробуйте другую ссылку")
+        logger.error(f"Ошибка при обработке видео: {str(e)}")
+        await status_message.edit_text("❌ Произошла ошибка. Попробуйте другую ссылку.")
 
 async def download_video(url: str) -> str:
+    """Скачивает видео с использованием yt-dlp"""
+    # Создаем временную директорию
     os.makedirs(temp_dir, exist_ok=True)
     
+    # Настройки для yt-dlp
     ydl_opts = {
         'format': 'best[ext=mp4]/best',
         'outtmpl': os.path.join(temp_dir, '%(title).100s.%(ext)s'),
-        'quiet': True,
+        'quiet': False,
     }
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            return ydl.prepare_filename(info)
+            filename = ydl.prepare_filename(info)
+            logger.info(f"Видео скачано: {filename}")
+            return filename
     except Exception as e:
         logger.error(f"Ошибка скачивания: {str(e)}")
         return None
 
 @app.route('/')
 def home():
-    return "Bot is running!", 200
+    return "🤖 Bot is running! Send /start to your bot.", 200
 
 @app.route('/health')
 def health():
@@ -147,78 +163,101 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Endpoint для webhook"""
-    global bot_app
+    """Обработчик webhook от Telegram"""
+    global application
+    
+    if application is None:
+        logger.error("Application not initialized")
+        return "Application not ready", 503
+        
     try:
-        if bot_app:
-            # Получаем данные запроса
-            json_data = request.get_json()
-            if not json_data:
-                return 'no data', 400
-                
-            # Создаем объект Update
-            update = Update.de_json(json_data, bot_app.bot)
+        # Получаем данные от Telegram
+        json_data = request.get_json()
+        if not json_data:
+            return "No data", 400
             
-            # Обрабатываем update
-            async def process_update():
-                await bot_app.process_update(update)
-            
-            # Запускаем в event loop
+        # Создаем объект Update
+        update = Update.de_json(json_data, application.bot)
+        
+        # Обрабатываем update в отдельном потоке
+        def process_update():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(process_update())
-            loop.close()
-            
-            return 'ok', 200
-        else:
-            logger.error("Bot app not initialized")
-            return 'bot not ready', 503
-            
+            try:
+                loop.run_until_complete(application.process_update(update))
+            finally:
+                loop.close()
+        
+        thread = threading.Thread(target=process_update)
+        thread.start()
+        
+        return "ok", 200
+        
     except Exception as e:
         logger.error(f"Webhook error: {e}")
-        return 'error', 500
+        return "error", 500
 
 async def setup_webhook():
-    """Настройка webhook"""
-    global bot_app
-    try:
-        render_url = os.getenv('RENDER_EXTERNAL_URL')
-        if render_url:
-            webhook_url = f"{render_url}/webhook"
-            await bot_app.bot.set_webhook(webhook_url)
-            logger.info(f"Webhook установлен: {webhook_url}")
-            return True
-        else:
-            logger.warning("RENDER_EXTERNAL_URL не найден")
+    """Настраивает webhook для бота"""
+    global application
+    
+    if application is None:
+        application = create_application()
+        if application is None:
             return False
+    
+    try:
+        # Получаем URL от Render
+        render_url = os.getenv('RENDER_EXTERNAL_URL')
+        if not render_url:
+            logger.error("RENDER_EXTERNAL_URL not found")
+            return False
+            
+        webhook_url = f"{render_url}/webhook"
+        
+        # Устанавливаем webhook
+        await application.bot.set_webhook(
+            url=webhook_url,
+            drop_pending_updates=True
+        )
+        
+        logger.info(f"Webhook установлен: {webhook_url}")
+        return True
+        
     except Exception as e:
-        logger.error(f"Ошибка webhook: {e}")
+        logger.error(f"Ошибка при настройке webhook: {e}")
         return False
 
-def run_bot():
-    """Запуск бота"""
-    global bot_app
+def initialize_bot():
+    """Инициализирует бота при запуске"""
+    global application
     
-    # Инициализируем бота
-    bot_app = init_bot()
+    logger.info("Инициализация бота...")
     
-    if bot_app:
-        # Настраиваем webhook
+    # Создаем приложение
+    application = create_application()
+    if application is None:
+        logger.error("Не удалось создать приложение бота")
+        return
+    
+    # Настраиваем webhook
+    try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         success = loop.run_until_complete(setup_webhook())
         loop.close()
         
         if success:
-            logger.info("Бот инициализирован и webhook настроен")
+            logger.info("Бот успешно инициализирован")
         else:
             logger.error("Не удалось настроить webhook")
-    else:
-        logger.error("Не удалось инициализировать бота")
+            
+    except Exception as e:
+        logger.error(f"Ошибка инициализации: {e}")
 
-# Запускаем бота при старте приложения
-run_bot()
+# Инициализируем бота при импорте
+initialize_bot()
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
